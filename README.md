@@ -4,15 +4,16 @@
 
 ## 运行
 
-先安装 FFmpeg，并确保 `ffmpeg` 在系统 `PATH` 中。
+先安装 FFmpeg，并确保 `ffmpeg` 在系统 `PATH` 中；再安装 Python 依赖：
 
 ```bash
+python3 -m pip install -r requirements.txt
 python3 m3u8_downloader_gui.py
 ```
 
 在界面中粘贴 M3U8 地址，每行一个地址，然后选择下载位置并点击“开始下载”。程序支持批量任务、同一个点播 m3u8 内的分片并发下载、下载日志、取消下载，以及可选的 User-Agent 和 Referer。
 
-“分片并发数”默认是 4，可以根据网络和服务器情况调整到 2～8。普通的、未加密的 TS 点播流会使用线程池并发下载；加密、fMP4、直播或复杂主播放列表会自动交给 FFmpeg 处理。
+“分片并发数”默认是 4，可以根据网络和服务器情况调整到 2～8。普通的、未加密的 TS 点播流会使用线程池并发下载；每个下载线程维护独立的 `requests.Session`，以复用 Keep-Alive 连接并减少 TLS 握手。加密、fMP4、直播或复杂主播放列表会自动交给 FFmpeg 处理。
 
 ## 说明
 

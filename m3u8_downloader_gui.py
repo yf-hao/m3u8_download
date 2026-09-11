@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
+import requests
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -54,6 +55,7 @@ class M3U8DownloaderApp:
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.cancel_event = threading.Event()
+        self.http_local = threading.local()
         self.current_process: subprocess.Popen[str] | None = None
         self.worker_thread: threading.Thread | None = None
 
@@ -471,19 +473,32 @@ class M3U8DownloaderApp:
         target_file = parts_dir / segment.filename
         temp_file = parts_dir / f"{segment.filename}.part"
 
-        request = Request(segment.url, headers=headers)
+        if not hasattr(self, "http_local"):
+            self.http_local = threading.local()
+        session = getattr(self.http_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({"Accept-Encoding": "identity"})
+            self.http_local.session = session
+
         try:
-            with urlopen(request, timeout=30) as response:
+            with session.get(
+                segment.url,
+                headers=headers,
+                timeout=(10, 30),
+                stream=True,
+            ) as response:
+                response.raise_for_status()
                 with temp_file.open("wb") as output:
                     total_bytes = 0
-                    while True:
+                    for chunk in response.iter_content(
+                        chunk_size=1024 * 1024
+                    ):
                         if self.cancel_event.is_set():
                             raise DownloadCancelled()
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        output.write(chunk)
-                        total_bytes += len(chunk)
+                        if chunk:
+                            output.write(chunk)
+                            total_bytes += len(chunk)
 
             if total_bytes == 0:
                 raise OSError("服务器返回了空分片")
@@ -494,7 +509,7 @@ class M3U8DownloaderApp:
             if temp_file.exists():
                 temp_file.unlink()
             raise
-        except (OSError, URLError):
+        except (OSError, requests.RequestException):
             if temp_file.exists():
                 temp_file.unlink()
             raise
@@ -505,14 +520,14 @@ class M3U8DownloaderApp:
         parts_dir: Path,
         headers: dict[str, str],
     ) -> int:
-        last_error: OSError | URLError | None = None
+        last_error: OSError | requests.RequestException | None = None
 
         for attempt in range(1, 4):
             try:
                 return self._download_segment(segment, parts_dir, headers)
             except DownloadCancelled:
                 raise
-            except (OSError, URLError) as exc:
+            except (OSError, requests.RequestException) as exc:
                 last_error = exc
                 if attempt < 3:
                     for _ in range(attempt * 5):
@@ -714,7 +729,7 @@ class M3U8DownloaderApp:
                     )
             except DownloadCancelled:
                 return "cancelled"
-            except (HTTPError, URLError, OSError) as exc:
+            except (OSError, requests.RequestException) as exc:
                 self.events.put(("error", f"分片下载失败：{exc}"))
                 return "failed"
             finally:
