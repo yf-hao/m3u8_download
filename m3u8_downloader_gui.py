@@ -20,6 +20,8 @@ from tkinter import filedialog, messagebox, ttk
 DURATION_PATTERN = re.compile(
     r"Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)"
 )
+RETRY_DELAYS = (1.0, 3.0, 6.0)
+MAX_SEGMENT_ATTEMPTS = len(RETRY_DELAYS) + 1
 
 
 class UnsupportedPlaylist(Exception):
@@ -54,6 +56,7 @@ class M3U8DownloaderApp:
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.cancel_event = threading.Event()
+        self.handshake_lock = threading.Lock()
         self.http_local = threading.local()
         self.current_process: subprocess.Popen[str] | None = None
         self.worker_thread: threading.Thread | None = None
@@ -357,15 +360,38 @@ class M3U8DownloaderApp:
             session = requests.Session()
             session.headers.update({"Accept-Encoding": "identity"})
             self.http_local.session = session
+            self.http_local.session_is_fresh = True
         return session
+
+    def _session_get(
+        self,
+        session: requests.Session,
+        url: str,
+        headers: dict[str, str],
+        **kwargs,
+    ) -> requests.Response:
+        if not hasattr(self, "handshake_lock"):
+            self.handshake_lock = threading.Lock()
+        session_is_fresh = getattr(
+            self.http_local,
+            "session_is_fresh",
+            False,
+        )
+        if session_is_fresh:
+            with self.handshake_lock:
+                response = session.get(url, headers=headers, **kwargs)
+            self.http_local.session_is_fresh = False
+            return response
+        return session.get(url, headers=headers, **kwargs)
 
     def _fetch_playlist(self, url: str, headers: dict[str, str]) -> str:
         last_error: requests.RequestException | None = None
 
-        for attempt in range(1, 4):
+        for attempt in range(1, MAX_SEGMENT_ATTEMPTS + 1):
             session = self._get_http_session()
             try:
-                with session.get(
+                with self._session_get(
+                    session,
                     url,
                     headers=headers,
                     timeout=(10, 30),
@@ -375,18 +401,19 @@ class M3U8DownloaderApp:
             except requests.RequestException as exc:
                 last_error = exc
                 self._discard_http_session()
-                if attempt < 3:
+                if attempt < MAX_SEGMENT_ATTEMPTS:
+                    delay = RETRY_DELAYS[attempt - 1]
                     self.events.put(
                         (
                             "log",
-                            f"播放列表重试 {attempt + 1}/3：{url}；"
+                            f"播放列表重试 {attempt + 1}/"
+                            f"{MAX_SEGMENT_ATTEMPTS}，等待 "
+                            f"{delay:g} 秒：{url}；"
                             f"{type(exc).__name__}: {exc}",
                         )
                     )
-                    for _ in range(attempt * 5):
-                        if self.cancel_event.is_set():
-                            raise DownloadCancelled()
-                        time.sleep(0.1)
+                    if self.cancel_event.wait(delay):
+                        raise DownloadCancelled()
 
         if last_error is not None:
             raise last_error
@@ -513,7 +540,8 @@ class M3U8DownloaderApp:
         session = self._get_http_session()
 
         try:
-            with session.get(
+            with self._session_get(
+                session,
                 segment.url,
                 headers=headers,
                 timeout=(10, 30),
@@ -555,7 +583,7 @@ class M3U8DownloaderApp:
             IncompleteRead | OSError | requests.RequestException | None
         ) = None
 
-        for attempt in range(1, 4):
+        for attempt in range(1, MAX_SEGMENT_ATTEMPTS + 1):
             try:
                 return self._download_segment(segment, parts_dir, headers)
             except DownloadCancelled:
@@ -570,27 +598,28 @@ class M3U8DownloaderApp:
             ) as exc:
                 last_error = exc
                 self._discard_http_session()
-                if attempt < 3:
+                if attempt < MAX_SEGMENT_ATTEMPTS:
+                    delay = RETRY_DELAYS[attempt - 1]
                     self.events.put(
                         (
                             "log",
-                            f"分片重试 {attempt + 1}/3：{segment.url}；"
+                            f"分片重试 {attempt + 1}/"
+                            f"{MAX_SEGMENT_ATTEMPTS}，等待 "
+                            f"{delay:g} 秒：{segment.url}；"
                             f"{type(exc).__name__}: {exc}",
                         )
                     )
+                    if self.cancel_event.wait(delay):
+                        raise DownloadCancelled()
                 else:
                     self.events.put(
                         (
                             "log",
-                            f"分片第 3/3 次失败：{segment.url}；"
+                            f"分片第 {MAX_SEGMENT_ATTEMPTS}/"
+                            f"{MAX_SEGMENT_ATTEMPTS} 次失败：{segment.url}；"
                             f"{type(exc).__name__}: {exc}",
                         )
                     )
-                if attempt < 3:
-                    for _ in range(attempt * 5):
-                        if self.cancel_event.is_set():
-                            raise DownloadCancelled()
-                        time.sleep(0.1)
 
         if last_error is not None:
             raise last_error
@@ -601,6 +630,8 @@ class M3U8DownloaderApp:
         if session is not None:
             session.close()
             del self.http_local.session
+        if hasattr(self.http_local, "session_is_fresh"):
+            del self.http_local.session_is_fresh
 
     @staticmethod
     def _format_rate(bytes_per_second: float) -> str:
