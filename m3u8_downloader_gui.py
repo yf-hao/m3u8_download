@@ -1,4 +1,5 @@
 import hashlib
+from http.client import IncompleteRead
 import math
 import queue
 import re
@@ -172,7 +173,7 @@ class M3U8DownloaderApp:
         ttk.Spinbox(
             advanced_frame,
             from_=1,
-            to=16,
+            to=5,
             textvariable=self.segment_workers,
             width=8,
         ).grid(
@@ -311,10 +312,10 @@ class M3U8DownloaderApp:
             messagebox.showwarning("并发数错误", "分片并发数必须是整数。")
             return
 
-        if not 1 <= segment_workers <= 16:
+        if not 1 <= segment_workers <= 5:
             messagebox.showwarning(
                 "并发数错误",
-                "分片并发数请设置在 1 到 16 之间。",
+                "分片并发数请设置在 1 到 5 之间。",
             )
             return
 
@@ -520,15 +521,41 @@ class M3U8DownloaderApp:
         parts_dir: Path,
         headers: dict[str, str],
     ) -> int:
-        last_error: OSError | requests.RequestException | None = None
+        last_error: (
+            IncompleteRead | OSError | requests.RequestException | None
+        ) = None
 
         for attempt in range(1, 4):
             try:
                 return self._download_segment(segment, parts_dir, headers)
             except DownloadCancelled:
                 raise
-            except (OSError, requests.RequestException) as exc:
+            except (
+                IncompleteRead,
+                OSError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ReadTimeout,
+            ) as exc:
                 last_error = exc
+                self._discard_http_session()
+                if attempt < 3:
+                    self.events.put(
+                        (
+                            "log",
+                            f"分片重试 {attempt + 1}/3：{segment.url}；"
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+                else:
+                    self.events.put(
+                        (
+                            "log",
+                            f"分片第 3/3 次失败：{segment.url}；"
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    )
                 if attempt < 3:
                     for _ in range(attempt * 5):
                         if self.cancel_event.is_set():
@@ -538,6 +565,12 @@ class M3U8DownloaderApp:
         if last_error is not None:
             raise last_error
         raise OSError("分片下载失败")
+
+    def _discard_http_session(self) -> None:
+        session = getattr(self.http_local, "session", None)
+        if session is not None:
+            session.close()
+            del self.http_local.session
 
     @staticmethod
     def _format_rate(bytes_per_second: float) -> str:
@@ -690,11 +723,13 @@ class M3U8DownloaderApp:
             downloaded_bytes = 0
 
             try:
+                failed_segment: SegmentInfo | None = None
                 for future in as_completed(futures):
                     if self.cancel_event.is_set():
                         raise DownloadCancelled()
 
                     segment = futures[future]
+                    failed_segment = segment
                     downloaded_bytes += future.result()
                     completed_duration += segment.duration
                     if plan.total_duration > 0:
@@ -729,8 +764,23 @@ class M3U8DownloaderApp:
                     )
             except DownloadCancelled:
                 return "cancelled"
-            except (OSError, requests.RequestException) as exc:
-                self.events.put(("error", f"分片下载失败：{exc}"))
+            except (
+                IncompleteRead,
+                OSError,
+                requests.RequestException,
+            ) as exc:
+                segment_url = (
+                    failed_segment.url
+                    if failed_segment is not None
+                    else "未知分片"
+                )
+                self.events.put(
+                    (
+                        "error",
+                        f"分片下载失败：{segment_url}；"
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                )
                 return "failed"
             finally:
                 for future in futures:
