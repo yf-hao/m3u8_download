@@ -1,12 +1,17 @@
 import hashlib
+import math
 import queue
 import re
 import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -15,6 +20,29 @@ from tkinter import filedialog, messagebox, ttk
 DURATION_PATTERN = re.compile(
     r"Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)"
 )
+
+
+class UnsupportedPlaylist(Exception):
+    pass
+
+
+class DownloadCancelled(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class SegmentInfo:
+    index: int
+    url: str
+    duration: float
+    filename: str
+
+
+@dataclass(frozen=True)
+class SegmentPlan:
+    segments: list[SegmentInfo]
+    target_duration: int
+    total_duration: float
 
 
 class M3U8DownloaderApp:
@@ -30,6 +58,7 @@ class M3U8DownloaderApp:
         self.worker_thread: threading.Thread | None = None
 
         self.output_dir = tk.StringVar(value=str(Path.cwd() / "downloads"))
+        self.segment_workers = tk.IntVar(value=4)
         self.user_agent = tk.StringVar(
             value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
@@ -127,6 +156,27 @@ class M3U8DownloaderApp:
             row=1,
             column=1,
             sticky="ew",
+            padx=(0, 10),
+            pady=(4, 8),
+        )
+
+        ttk.Label(advanced_frame, text="分片并发数").grid(
+            row=2,
+            column=0,
+            sticky="w",
+            padx=(10, 6),
+            pady=(4, 8),
+        )
+        ttk.Spinbox(
+            advanced_frame,
+            from_=1,
+            to=16,
+            textvariable=self.segment_workers,
+            width=8,
+        ).grid(
+            row=2,
+            column=1,
+            sticky="w",
             padx=(0, 10),
             pady=(4, 8),
         )
@@ -253,6 +303,18 @@ class M3U8DownloaderApp:
 
         user_agent = self.user_agent.get().strip()
         referer = self.referer.get().strip()
+        try:
+            segment_workers = int(self.segment_workers.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("并发数错误", "分片并发数必须是整数。")
+            return
+
+        if not 1 <= segment_workers <= 16:
+            messagebox.showwarning(
+                "并发数错误",
+                "分片并发数请设置在 1 到 16 之间。",
+            )
+            return
 
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -270,10 +332,447 @@ class M3U8DownloaderApp:
 
         self.worker_thread = threading.Thread(
             target=self._download_worker,
-            args=(urls, output_dir, user_agent, referer),
+            args=(urls, output_dir, user_agent, referer, segment_workers),
             daemon=True,
         )
         self.worker_thread.start()
+
+    @staticmethod
+    def _parse_attributes(value: str) -> dict[str, str]:
+        attributes: dict[str, str] = {}
+        for item in re.split(r',(?=[A-Z0-9-]+=)', value):
+            if "=" not in item:
+                continue
+            key, attribute_value = item.split("=", 1)
+            attributes[key.strip().upper()] = attribute_value.strip().strip('"')
+        return attributes
+
+    @staticmethod
+    def _fetch_playlist(url: str, headers: dict[str, str]) -> str:
+        request = Request(url, headers=headers)
+        with urlopen(request, timeout=20) as response:
+            return response.read().decode("utf-8-sig")
+
+    def _load_segment_plan(
+        self,
+        url: str,
+        headers: dict[str, str],
+    ) -> SegmentPlan:
+        playlist_url = url
+        playlist = self._fetch_playlist(playlist_url, headers)
+
+        if "#EXT-X-STREAM-INF:" in playlist:
+            if re.search(
+                r"#EXT-X-MEDIA:.*TYPE=AUDIO",
+                playlist,
+                flags=re.IGNORECASE,
+            ):
+                raise UnsupportedPlaylist(
+                    "主播放列表包含独立音频轨道"
+                )
+
+            lines = [line.strip() for line in playlist.splitlines()]
+            variants: list[tuple[int, str]] = []
+            for index, line in enumerate(lines):
+                if not line.startswith("#EXT-X-STREAM-INF:"):
+                    continue
+
+                attributes = self._parse_attributes(line.split(":", 1)[1])
+                variant_url = next(
+                    (
+                        candidate
+                        for candidate in lines[index + 1 :]
+                        if candidate and not candidate.startswith("#")
+                    ),
+                    None,
+                )
+                if variant_url:
+                    bandwidth = int(attributes.get("BANDWIDTH", "0"))
+                    variants.append(
+                        (bandwidth, urljoin(playlist_url, variant_url))
+                    )
+
+            if not variants:
+                raise UnsupportedPlaylist("主播放列表没有可用的视频变体")
+
+            _, playlist_url = max(variants, key=lambda item: item[0])
+            playlist = self._fetch_playlist(playlist_url, headers)
+
+        if "#EXT-X-ENDLIST" not in playlist:
+            raise UnsupportedPlaylist("播放列表不是已结束的点播流")
+
+        if any(
+            tag in playlist
+            for tag in (
+                "#EXT-X-BYTERANGE",
+                "#EXT-X-DISCONTINUITY",
+                "#EXT-X-MAP",
+            )
+        ):
+            raise UnsupportedPlaylist(
+                "播放列表包含字节范围、断点或 fMP4 初始化片段"
+            )
+
+        for line in playlist.splitlines():
+            if line.startswith("#EXT-X-KEY:"):
+                attributes = self._parse_attributes(line.split(":", 1)[1])
+                if attributes.get("METHOD", "NONE").upper() != "NONE":
+                    raise UnsupportedPlaylist("播放列表包含加密分片")
+
+        target_duration = 0
+        pending_duration: float | None = None
+        segments: list[SegmentInfo] = []
+
+        for line in playlist.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith("#EXT-X-TARGETDURATION:"):
+                target_duration = int(line.split(":", 1)[1])
+            elif line.startswith("#EXTINF:"):
+                duration_text = line.split(":", 1)[1].split(",", 1)[0]
+                pending_duration = float(duration_text)
+            elif not line.startswith("#") and pending_duration is not None:
+                segment_index = len(segments)
+                segments.append(
+                    SegmentInfo(
+                        index=segment_index,
+                        url=urljoin(playlist_url, line),
+                        duration=pending_duration,
+                        filename=f"{segment_index:08d}.ts",
+                    )
+                )
+                pending_duration = None
+
+        if not segments:
+            raise UnsupportedPlaylist("播放列表中没有可下载的分片")
+
+        if target_duration <= 0:
+            target_duration = math.ceil(
+                max(segment.duration for segment in segments)
+            )
+
+        return SegmentPlan(
+            segments=segments,
+            target_duration=target_duration,
+            total_duration=sum(segment.duration for segment in segments),
+        )
+
+    def _download_segment(
+        self,
+        segment: SegmentInfo,
+        parts_dir: Path,
+        headers: dict[str, str],
+    ) -> int:
+        if self.cancel_event.is_set():
+            raise DownloadCancelled()
+
+        target_file = parts_dir / segment.filename
+        temp_file = parts_dir / f"{segment.filename}.part"
+
+        request = Request(segment.url, headers=headers)
+        try:
+            with urlopen(request, timeout=30) as response:
+                with temp_file.open("wb") as output:
+                    total_bytes = 0
+                    while True:
+                        if self.cancel_event.is_set():
+                            raise DownloadCancelled()
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        total_bytes += len(chunk)
+
+            if total_bytes == 0:
+                raise OSError("服务器返回了空分片")
+
+            temp_file.replace(target_file)
+            return total_bytes
+        except DownloadCancelled:
+            if temp_file.exists():
+                temp_file.unlink()
+            raise
+        except (OSError, URLError):
+            if temp_file.exists():
+                temp_file.unlink()
+            raise
+
+    def _download_segment_with_retry(
+        self,
+        segment: SegmentInfo,
+        parts_dir: Path,
+        headers: dict[str, str],
+    ) -> int:
+        last_error: OSError | URLError | None = None
+
+        for attempt in range(1, 4):
+            try:
+                return self._download_segment(segment, parts_dir, headers)
+            except DownloadCancelled:
+                raise
+            except (OSError, URLError) as exc:
+                last_error = exc
+                if attempt < 3:
+                    for _ in range(attempt * 5):
+                        if self.cancel_event.is_set():
+                            raise DownloadCancelled()
+                        time.sleep(0.1)
+
+        if last_error is not None:
+            raise last_error
+        raise OSError("分片下载失败")
+
+    @staticmethod
+    def _format_rate(bytes_per_second: float) -> str:
+        units = ("B/s", "KB/s", "MB/s", "GB/s")
+        value = max(0.0, bytes_per_second)
+        unit_index = 0
+        while value >= 1024 and unit_index < len(units) - 1:
+            value /= 1024
+            unit_index += 1
+        return f"{value:.1f} {units[unit_index]}"
+
+    def _run_local_merge(
+        self,
+        manifest: Path,
+        temp_file: Path,
+        user_agent: str,
+        referer: str,
+    ) -> str:
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-protocol_whitelist",
+            "file,crypto,data",
+            "-allowed_extensions",
+            "ALL",
+            "-i",
+            str(manifest),
+            "-c",
+            "copy",
+            str(temp_file),
+        ]
+
+        if user_agent:
+            command[command.index("-i"):command.index("-i")] = [
+                "-user_agent",
+                user_agent,
+            ]
+        if referer:
+            input_index = command.index("-i")
+            command[input_index:input_index] = ["-referer", referer]
+
+        output_lines: list[str] = []
+        progress_data: dict[str, float | str | None] = {
+            "duration_us": None,
+            "out_time_us": 0,
+            "speed": None,
+        }
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            self.events.put(("error", f"启动 FFmpeg 合并失败：{exc}"))
+            return "failed"
+
+        self.current_process = process
+        reader = threading.Thread(
+            target=self._read_process_output,
+            args=(process, output_lines, progress_data),
+            daemon=True,
+        )
+        reader.start()
+
+        while process.poll() is None:
+            if self.cancel_event.is_set():
+                process.terminate()
+                break
+            time.sleep(0.1)
+
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+        reader.join(timeout=2)
+        return_code = process.returncode
+        self.current_process = None
+
+        if self.cancel_event.is_set():
+            return "cancelled"
+        if return_code != 0 or not temp_file.exists() or not temp_file.stat().st_size:
+            detail = output_lines[-1] if output_lines else "未知错误"
+            self.events.put(("error", f"FFmpeg 合并失败：{detail}"))
+            return "failed"
+        return "success"
+
+    def _try_parallel_segment_download(
+        self,
+        url: str,
+        output_file: Path,
+        temp_file: Path,
+        user_agent: str,
+        referer: str,
+        segment_workers: int,
+        index: int,
+        total_urls: int,
+        filename: str,
+    ) -> str:
+        headers = {}
+        if user_agent:
+            headers["User-Agent"] = user_agent
+        if referer:
+            headers["Referer"] = referer
+
+        try:
+            plan = self._load_segment_plan(url, headers)
+        except UnsupportedPlaylist as exc:
+            self.events.put(("log", f"改用 FFmpeg：{exc}"))
+            return "fallback"
+        except (HTTPError, URLError, OSError, ValueError) as exc:
+            self.events.put(("log", f"读取播放列表失败，改用 FFmpeg：{exc}"))
+            return "fallback"
+
+        parts_dir = temp_file.parent / f".{filename}.parts"
+        if parts_dir.exists():
+            shutil.rmtree(parts_dir)
+        parts_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self.events.put(
+                (
+                    "log",
+                    f"检测到 {len(plan.segments)} 个普通 TS 分片，"
+                    f"使用 {segment_workers} 个线程下载。",
+                )
+            )
+
+            executor = ThreadPoolExecutor(max_workers=segment_workers)
+            futures = {
+                executor.submit(
+                    self._download_segment_with_retry,
+                    segment,
+                    parts_dir,
+                    headers,
+                ): segment
+                for segment in plan.segments
+            }
+            started_at = time.monotonic()
+            completed_duration = 0.0
+            downloaded_bytes = 0
+
+            try:
+                for future in as_completed(futures):
+                    if self.cancel_event.is_set():
+                        raise DownloadCancelled()
+
+                    segment = futures[future]
+                    downloaded_bytes += future.result()
+                    completed_duration += segment.duration
+                    if plan.total_duration > 0:
+                        percent = (
+                            completed_duration / plan.total_duration * 100
+                        )
+                    else:
+                        percent = (
+                            len(
+                                [
+                                    item
+                                    for item in futures
+                                    if item.done()
+                                ]
+                            )
+                            / len(plan.segments)
+                            * 100
+                        )
+                    elapsed = max(0.001, time.monotonic() - started_at)
+                    speed = self._format_rate(downloaded_bytes / elapsed)
+                    self.events.put(
+                        (
+                            "progress",
+                            (
+                                min(100.0, percent),
+                                index,
+                                total_urls,
+                                filename,
+                                speed,
+                            ),
+                        )
+                    )
+            except DownloadCancelled:
+                return "cancelled"
+            except (HTTPError, URLError, OSError) as exc:
+                self.events.put(("error", f"分片下载失败：{exc}"))
+                return "failed"
+            finally:
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+
+            if self.cancel_event.is_set():
+                return "cancelled"
+
+            manifest = parts_dir / "local.m3u8"
+            manifest_lines = [
+                "#EXTM3U",
+                "#EXT-X-VERSION:3",
+                f"#EXT-X-TARGETDURATION:{plan.target_duration}",
+                "#EXT-X-MEDIA-SEQUENCE:0",
+            ]
+            for segment in plan.segments:
+                manifest_lines.extend(
+                    [
+                        f"#EXTINF:{segment.duration:.6f},",
+                        segment.filename,
+                    ]
+                )
+            manifest_lines.append("#EXT-X-ENDLIST")
+            manifest.write_text(
+                "\n".join(manifest_lines) + "\n",
+                encoding="utf-8",
+            )
+
+            self.events.put(("status", f"正在合并：{filename}"))
+            self.events.put(
+                (
+                    "progress",
+                    (99.0, index, total_urls, filename, ""),
+                )
+            )
+            merge_result = self._run_local_merge(
+                manifest,
+                temp_file,
+                user_agent,
+                referer,
+            )
+            if merge_result != "success":
+                return merge_result
+
+            temp_file.replace(output_file)
+            return "success"
+        except DownloadCancelled:
+            return "cancelled"
+        except OSError as exc:
+            self.events.put(("error", f"并发下载处理失败：{exc}"))
+            return "failed"
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
+            if parts_dir.exists():
+                shutil.rmtree(parts_dir)
 
     def _download_worker(
         self,
@@ -281,6 +780,7 @@ class M3U8DownloaderApp:
         output_dir: Path,
         user_agent: str,
         referer: str,
+        segment_workers: int,
     ) -> None:
         completed = 0
         failed = 0
@@ -309,6 +809,27 @@ class M3U8DownloaderApp:
 
                 if temp_file.exists():
                     temp_file.unlink()
+
+                parallel_result = self._try_parallel_segment_download(
+                    url,
+                    output_file,
+                    temp_file,
+                    user_agent,
+                    referer,
+                    segment_workers,
+                    index,
+                    len(urls),
+                    filename,
+                )
+                if parallel_result == "success":
+                    completed += 1
+                    self.events.put(("log", f"下载完成：{output_file}"))
+                    continue
+                if parallel_result == "cancelled":
+                    break
+                if parallel_result == "failed":
+                    failed += 1
+                    continue
 
                 command = [
                     "ffmpeg",
