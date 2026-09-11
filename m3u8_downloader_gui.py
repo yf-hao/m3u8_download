@@ -10,9 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
-from urllib.request import Request, urlopen
 
 import requests
 import tkinter as tk
@@ -350,11 +348,49 @@ class M3U8DownloaderApp:
             attributes[key.strip().upper()] = attribute_value.strip().strip('"')
         return attributes
 
-    @staticmethod
-    def _fetch_playlist(url: str, headers: dict[str, str]) -> str:
-        request = Request(url, headers=headers)
-        with urlopen(request, timeout=20) as response:
-            return response.read().decode("utf-8-sig")
+    def _get_http_session(self) -> requests.Session:
+        if not hasattr(self, "http_local"):
+            self.http_local = threading.local()
+
+        session = getattr(self.http_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update({"Accept-Encoding": "identity"})
+            self.http_local.session = session
+        return session
+
+    def _fetch_playlist(self, url: str, headers: dict[str, str]) -> str:
+        last_error: requests.RequestException | None = None
+
+        for attempt in range(1, 4):
+            session = self._get_http_session()
+            try:
+                with session.get(
+                    url,
+                    headers=headers,
+                    timeout=(10, 30),
+                ) as response:
+                    response.raise_for_status()
+                    return response.content.decode("utf-8-sig")
+            except requests.RequestException as exc:
+                last_error = exc
+                self._discard_http_session()
+                if attempt < 3:
+                    self.events.put(
+                        (
+                            "log",
+                            f"播放列表重试 {attempt + 1}/3：{url}；"
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+                    for _ in range(attempt * 5):
+                        if self.cancel_event.is_set():
+                            raise DownloadCancelled()
+                        time.sleep(0.1)
+
+        if last_error is not None:
+            raise last_error
+        raise OSError("播放列表读取失败")
 
     def _load_segment_plan(
         self,
@@ -474,13 +510,7 @@ class M3U8DownloaderApp:
         target_file = parts_dir / segment.filename
         temp_file = parts_dir / f"{segment.filename}.part"
 
-        if not hasattr(self, "http_local"):
-            self.http_local = threading.local()
-        session = getattr(self.http_local, "session", None)
-        if session is None:
-            session = requests.Session()
-            session.headers.update({"Accept-Encoding": "identity"})
-            self.http_local.session = session
+        session = self._get_http_session()
 
         try:
             with session.get(
@@ -690,7 +720,7 @@ class M3U8DownloaderApp:
         except UnsupportedPlaylist as exc:
             self.events.put(("log", f"改用 FFmpeg：{exc}"))
             return "fallback"
-        except (HTTPError, URLError, OSError, ValueError) as exc:
+        except (requests.RequestException, OSError, ValueError) as exc:
             self.events.put(("log", f"读取播放列表失败，改用 FFmpeg：{exc}"))
             return "fallback"
 
